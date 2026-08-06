@@ -1,6 +1,6 @@
 module github.com/iowis/sqlsee
 
-go 1.26.5
+go 1.26
 
 require (
 	github.com/google/uuid v1.6.0
@@ -15,6 +15,6 @@ require (
 	github.com/kr/text v0.2.0 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/rogpeppe/go-internal v1.16.0 // indirect
-	golang.org/x/text v0.29.0 // indirect
+	golang.org/x/text v0.39.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
