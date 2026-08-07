@@ -1,9 +1,12 @@
 package sqlsee
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"maps"
 	"reflect"
+	"slices"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -56,8 +59,13 @@ type FilterGroup struct {
 	Filters []Filter `json:"filters"`
 }
 
-func All(filters ...Filter) FilterGroup { return FilterGroup{Filters: filters} }
-func Any(filters ...Filter) FilterGroup { return FilterGroup{Any: true, Filters: filters} }
+func All(filters ...Filter) FilterGroup {
+	return FilterGroup{Filters: filters}
+}
+
+func Any(filters ...Filter) FilterGroup {
+	return FilterGroup{Any: true, Filters: filters}
+}
 
 type Request struct {
 	Limit  int
@@ -192,49 +200,92 @@ func New[T any](db DBTX, cfg Config, options ...Option) (*Query[T], error) {
 		cursorSecret: append([]byte(nil), cfg.CursorSecret...),
 		pluginNames:  make(map[string]struct{}, len(options)),
 	}
-	pluginFields := make(map[string]struct{}, len(meta.fields))
-	for field := range meta.fields {
-		pluginFields[field] = struct{}{}
-	}
-	pluginContext := PluginContext{
-		primaryKey: cfg.PrimaryKey,
-		alias:      cfg.Alias,
-		fields:     pluginFields,
-	}
-	for _, option := range options {
-		plugin := option.plugin
-		if isNilPlugin(plugin) {
-			return nil, fmt.Errorf("sqlsee: nil plugin")
-		}
 
-		name := plugin.Name()
-		if strings.TrimSpace(name) == "" {
-			return nil, fmt.Errorf("sqlsee: plugin name is required")
-		}
-		if _, duplicate := query.pluginNames[name]; duplicate {
-			return nil, fmt.Errorf("sqlsee: duplicate plugin %q", name)
-		}
-
-		handler, err := plugin.Install(pluginContext)
-		if err != nil {
-			return nil, fmt.Errorf("sqlsee: install plugin %q: %w", name, err)
-		}
-		if handler == nil {
-			return nil, fmt.Errorf("sqlsee: plugin %q returned a nil handler", name)
-		}
-
-		query.pluginNames[name] = struct{}{}
-		query.plugins = append(query.plugins, installedPlugin{name: name, handler: handler})
-	}
+  if len(options) > 0 {
+    if err := query.AddOptions(options...); err != nil {
+      return nil, err
+    }
+  }
 
 	return query, nil
 }
 
-func (q *Query[T]) List(ctx context.Context, req Request, options ...ListOption) (Page[T], error) {
+func (q *Query[T]) Clone() *Query[T] {
+	return &Query[T]{
+		db:           q.db,
+		table:        q.table,
+		alias:        q.alias,
+		from:         q.from,
+		primaryKey:   q.primaryKey,
+		columns:      slices.Clone(q.columns),
+		meta:         q.meta,
+		filterable:   maps.Clone(q.filterable),
+		sortable:     maps.Clone(q.sortable),
+		defaultSort:  slices.Clone(q.defaultSort),
+		defaultLimit: q.defaultLimit,
+		maxLimit:     q.maxLimit,
+		cursorSecret: bytes.Clone(q.cursorSecret),
+		pluginNames:  maps.Clone(q.pluginNames),
+	}
+}
+
+func (q *Query[T]) AddOptions(options ...Option) error {
+	pluginFields := make(map[string]struct{}, len(q.meta.fields))
+	for field := range q.meta.fields {
+		pluginFields[field] = struct{}{}
+	}
+
+	pluginContext := PluginContext{
+		primaryKey: q.primaryKey,
+		alias:      q.alias,
+		fields:     pluginFields,
+	}
+
+	for _, option := range options {
+		plugin := option.plugin
+		if isNilPlugin(plugin) {
+			return fmt.Errorf("sqlsee: nil plugin")
+		}
+
+		name := plugin.Name()
+		if strings.TrimSpace(name) == "" {
+			return  fmt.Errorf("sqlsee: plugin name is required")
+		}
+		if _, duplicate := q.pluginNames[name]; duplicate {
+			return  fmt.Errorf("sqlsee: duplicate plugin %q", name)
+		}
+
+		handler, err := plugin.Install(pluginContext)
+		if err != nil {
+			return fmt.Errorf("sqlsee: install plugin %q: %w", name, err)
+		}
+		if handler == nil {
+			return fmt.Errorf("sqlsee: plugin %q returned a nil handler", name)
+		}
+
+		q.pluginNames[name] = struct{}{}
+		q.plugins = append(q.plugins, installedPlugin{
+			name:    name,
+			handler: handler,
+		})
+	}
+
+	return nil
+}
+
+func (q *Query[T]) List(
+	ctx context.Context,
+	req Request,
+	options ...ListOption,
+) (Page[T], error) {
 	return q.list(ctx, req, options)
 }
 
-func (q *Query[T]) list(ctx context.Context, req Request, options []ListOption) (Page[T], error) {
+func (q *Query[T]) list(
+	ctx context.Context,
+	req Request,
+	options []ListOption,
+) (Page[T], error) {
 	limit := req.Limit
 	if limit == 0 {
 		limit = q.defaultLimit
@@ -447,7 +498,10 @@ func (q *Query[T]) resolveSort(requested []Sort) ([]Sort, error) {
 	}
 
 	if _, ok := seen[q.primaryKey]; !ok {
-		result = append(result, Sort{Field: q.primaryKey, Desc: result[len(result)-1].Desc})
+		result = append(result, Sort{
+			Field: q.primaryKey,
+			Desc:  result[len(result)-1].Desc,
+		})
 	}
 
 	return result, nil
