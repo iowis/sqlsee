@@ -21,12 +21,35 @@ type Sort struct {
 func Asc(field string) Sort  { return Sort{Field: field} }
 func Desc(field string) Sort { return Sort{Field: field, Desc: true} }
 
+type FilterOperator string
+
+const (
+	FilterOperatorILike  FilterOperator = "ilike"
+	FilterOperatorLike   FilterOperator = "like"
+	FilterOperatorEquals FilterOperator = "equals"
+)
+
 type Filter struct {
-	Field   string `json:"field"`
-	Pattern string `json:"pattern"`
+	Field    string         `json:"field"`
+	Operator FilterOperator `json:"operator,omitempty"`
+	Value    any            `json:"value,omitempty"`
+
+	// Pattern is retained for compatibility with Filter literals from earlier
+	// releases. New code should use ILike, Like, or Equals.
+	Pattern string `json:"pattern,omitempty"`
 }
 
-func ILike(field, pattern string) Filter { return Filter{Field: field, Pattern: pattern} }
+func ILike(field, pattern string) Filter {
+	return Filter{Field: field, Pattern: pattern}
+}
+
+func Like(field, pattern string) Filter {
+	return Filter{Field: field, Operator: FilterOperatorLike, Value: pattern}
+}
+
+func Equals(field string, value any) Filter {
+	return Filter{Field: field, Operator: FilterOperatorEquals, Value: value}
+}
 
 type FilterGroup struct {
 	Any     bool     `json:"any"`
@@ -61,7 +84,7 @@ type Config struct {
 	CursorSecret []byte
 }
 
-type Lister[T any] struct {
+type Query[T any] struct {
 	db DBTX
 
 	table, alias, from, primaryKey string
@@ -71,11 +94,17 @@ type Lister[T any] struct {
 	defaultSort                    []Sort
 	defaultLimit, maxLimit         int
 	cursorSecret                   []byte
+	plugins                        []installedPlugin
+	pluginNames                    map[string]struct{}
 }
 
-func New[T any](db DBTX, cfg Config) (*Lister[T], error) {
-	if db == nil || cfg.Table == "" {
-		return nil, fmt.Errorf("sqlsee: db and table are required")
+func New[T any](db DBTX, cfg Config, options ...Option) (*Query[T], error) {
+	if db == nil {
+		return nil, fmt.Errorf("sqlsee: db is required")
+	}
+
+	if cfg.Table == "" {
+		return nil, fmt.Errorf("sqlsee: table is required")
 	}
 
 	if cfg.Alias == "" {
@@ -147,60 +176,122 @@ func New[T any](db DBTX, cfg Config) (*Lister[T], error) {
 		return nil, err
 	}
 
-	return &Lister[T]{
-		db:    db,
-		table: cfg.Table,
-		alias: cfg.Alias,
-		from:  table + " AS " + quote(cfg.Alias), primaryKey: cfg.PrimaryKey,
-		columns: columns, meta: meta, filterable: filterable, sortable: sortable,
+	query := &Query[T]{
+		db:           db,
+		table:        cfg.Table,
+		alias:        cfg.Alias,
+		from:         table + " AS " + quote(cfg.Alias),
+		primaryKey:   cfg.PrimaryKey,
+		columns:      columns,
+		meta:         meta,
+		filterable:   filterable,
+		sortable:     sortable,
 		defaultSort:  append([]Sort(nil), cfg.DefaultSort...),
-		defaultLimit: cfg.DefaultLimit, maxLimit: cfg.MaxLimit,
+		defaultLimit: cfg.DefaultLimit,
+		maxLimit:     cfg.MaxLimit,
 		cursorSecret: append([]byte(nil), cfg.CursorSecret...),
-	}, nil
+		pluginNames:  make(map[string]struct{}, len(options)),
+	}
+	pluginFields := make(map[string]struct{}, len(meta.fields))
+	for field := range meta.fields {
+		pluginFields[field] = struct{}{}
+	}
+	pluginContext := PluginContext{
+		primaryKey: cfg.PrimaryKey,
+		alias:      cfg.Alias,
+		fields:     pluginFields,
+	}
+	for _, option := range options {
+		plugin := option.plugin
+		if isNilPlugin(plugin) {
+			return nil, fmt.Errorf("sqlsee: nil plugin")
+		}
+
+		name := plugin.Name()
+		if strings.TrimSpace(name) == "" {
+			return nil, fmt.Errorf("sqlsee: plugin name is required")
+		}
+		if _, duplicate := query.pluginNames[name]; duplicate {
+			return nil, fmt.Errorf("sqlsee: duplicate plugin %q", name)
+		}
+
+		handler, err := plugin.Install(pluginContext)
+		if err != nil {
+			return nil, fmt.Errorf("sqlsee: install plugin %q: %w", name, err)
+		}
+		if handler == nil {
+			return nil, fmt.Errorf("sqlsee: plugin %q returned a nil handler", name)
+		}
+
+		query.pluginNames[name] = struct{}{}
+		query.plugins = append(query.plugins, installedPlugin{name: name, handler: handler})
+	}
+
+	return query, nil
 }
 
-func (l *Lister[T]) List(ctx context.Context, req Request) (Page[T], error) {
-	return l.list(ctx, req, nil)
+func (q *Query[T]) List(ctx context.Context, req Request, options ...ListOption) (Page[T], error) {
+	return q.list(ctx, req, options)
 }
 
-type rowScope struct {
-	key   string
-	apply func(*sqlBuilder)
-}
-
-func (l *Lister[T]) list(ctx context.Context, req Request, scope *rowScope) (Page[T], error) {
+func (q *Query[T]) list(ctx context.Context, req Request, options []ListOption) (Page[T], error) {
 	limit := req.Limit
 	if limit == 0 {
-		limit = l.defaultLimit
+		limit = q.defaultLimit
 	}
 
-	if limit < 1 || limit > l.maxLimit {
-		return Page[T]{}, fmt.Errorf("sqlsee: limit must be between 1 and %d", l.maxLimit)
+	if limit < 1 || limit > q.maxLimit {
+		return Page[T]{}, fmt.Errorf("sqlsee: limit must be between 1 and %d", q.maxLimit)
 	}
 
-	sorts, err := l.resolveSort(req.Sort)
+	sorts, err := q.resolveSort(req.Sort)
 	if err != nil {
 		return Page[T]{}, err
 	}
 
+	inputs := make(map[string]PluginInput, len(options))
+	for _, option := range options {
+		if strings.TrimSpace(option.plugin) == "" {
+			return Page[T]{}, fmt.Errorf("sqlsee: plugin option name is required")
+		}
+		if _, installed := q.pluginNames[option.plugin]; !installed {
+			return Page[T]{}, fmt.Errorf("sqlsee: plugin %q is not installed", option.plugin)
+		}
+		if _, duplicate := inputs[option.plugin]; duplicate {
+			return Page[T]{}, fmt.Errorf("sqlsee: duplicate option for plugin %q", option.plugin)
+		}
+		inputs[option.plugin] = PluginInput{present: true, value: option.value}
+	}
+
+	results := make([]pluginResult, 0, len(q.plugins))
+	for _, plugin := range q.plugins {
+		input := inputs[plugin.name]
+		builder := &PluginBuilder{}
+		if err := plugin.handler(ctx, input, builder); err != nil {
+			return Page[T]{}, fmt.Errorf("sqlsee: plugin %q: %w", plugin.name, err)
+		}
+		results = append(results, pluginResult{
+			name:    plugin.name,
+			clauses: append([]sqlClause(nil), builder.clauses...),
+		})
+	}
+
 	b := &sqlBuilder{}
-	if err := l.addFilters(b, req.Where); err != nil {
+	joins, pluginScope, err := applyPluginResults(b, results)
+	if err != nil {
+		return Page[T]{}, err
+	}
+	if err := q.addFilters(b, req.Where); err != nil {
 		return Page[T]{}, err
 	}
 
-	scopeKey := ""
-	if scope != nil {
-		scope.apply(b)
-		scopeKey = scope.key
-	}
-
-	queryKey, err := queryFingerprint(l.table, sorts, req.Where, scopeKey)
+	queryKey, err := queryFingerprint(q.table, sorts, req.Where, pluginScope)
 	if err != nil {
 		return Page[T]{}, err
 	}
 
 	if req.Cursor != "" {
-		cursor, err := decodeCursor(req.Cursor, l.cursorSecret)
+		cursor, err := decodeCursor(req.Cursor, q.cursorSecret)
 		if err != nil {
 			return Page[T]{}, err
 		}
@@ -211,20 +302,24 @@ func (l *Lister[T]) list(ctx context.Context, req Request, scope *rowScope) (Pag
 
 		values := make([]any, len(sorts))
 		for i, sort := range sorts {
-			values[i], err = decodeValue(cursor.Keys[i], l.meta.fields[sort.Field].typ)
+			values[i], err = decodeValue(cursor.Keys[i], q.meta.fields[sort.Field].typ)
 			if err != nil || isNull(values[i]) {
 				return Page[T]{}, fmt.Errorf("sqlsee: invalid cursor value for %q", sort.Field)
 			}
 		}
 
-		b.where = append(b.where, l.keyset(b, sorts, values))
+		b.where = append(b.where, q.keyset(b, sorts, values))
 	}
 
 	var sql strings.Builder
 	sql.WriteString("SELECT ")
-	sql.WriteString(strings.Join(l.columns, ", "))
+	sql.WriteString(strings.Join(q.columns, ", "))
 	sql.WriteString(" FROM ")
-	sql.WriteString(l.from)
+	sql.WriteString(q.from)
+	if len(joins) > 0 {
+		sql.WriteByte(' ')
+		sql.WriteString(strings.Join(joins, " "))
+	}
 	if len(b.where) > 0 {
 		sql.WriteString(" WHERE ")
 		sql.WriteString(strings.Join(b.where, " AND "))
@@ -234,7 +329,7 @@ func (l *Lister[T]) list(ctx context.Context, req Request, scope *rowScope) (Pag
 		if i > 0 {
 			sql.WriteString(", ")
 		}
-		sql.WriteString(l.column(sort.Field))
+		sql.WriteString(q.column(sort.Field))
 		if sort.Desc {
 			sql.WriteString(" DESC")
 		} else {
@@ -244,7 +339,7 @@ func (l *Lister[T]) list(ctx context.Context, req Request, scope *rowScope) (Pag
 	sql.WriteString(" LIMIT ")
 	sql.WriteString(b.arg(limit + 1))
 
-	rows, err := l.db.Query(ctx, sql.String(), b.args...)
+	rows, err := q.db.Query(ctx, sql.String(), b.args...)
 	if err != nil {
 		return Page[T]{}, fmt.Errorf("sqlsee: query: %w", err)
 	}
@@ -263,18 +358,18 @@ func (l *Lister[T]) list(ctx context.Context, req Request, scope *rowScope) (Pag
 	keys := make([]any, len(sorts))
 
 	for i, sort := range sorts {
-		keys[i], err = l.meta.value(page.Items[len(page.Items)-1], sort.Field)
+		keys[i], err = q.meta.value(page.Items[len(page.Items)-1], sort.Field)
 		if err != nil || isNull(keys[i]) {
 			return Page[T]{}, fmt.Errorf("sqlsee: sort field %q must be non-null", sort.Field)
 		}
 	}
 
-	page.NextCursor, err = encodeCursor(queryKey, keys, l.cursorSecret)
+	page.NextCursor, err = encodeCursor(queryKey, keys, q.cursorSecret)
 
 	return page, err
 }
 
-func (l *Lister[T]) addFilters(b *sqlBuilder, groups []FilterGroup) error {
+func (q *Query[T]) addFilters(b *sqlBuilder, groups []FilterGroup) error {
 	for _, group := range groups {
 		if len(group.Filters) == 0 {
 			continue
@@ -282,11 +377,37 @@ func (l *Lister[T]) addFilters(b *sqlBuilder, groups []FilterGroup) error {
 
 		parts := make([]string, 0, len(group.Filters))
 		for _, filter := range group.Filters {
-			if _, ok := l.filterable[filter.Field]; !ok {
+			if _, ok := q.filterable[filter.Field]; !ok {
 				return fmt.Errorf("sqlsee: field %q is not filterable", filter.Field)
 			}
 
-			parts = append(parts, l.column(filter.Field)+" ILIKE "+b.arg(filter.Pattern))
+			operator := filter.Operator
+			value := filter.Value
+			if operator == "" {
+				operator = FilterOperatorILike
+			}
+			if operator != FilterOperatorEquals && value == nil {
+				value = filter.Pattern
+			}
+
+			sqlOperator := ""
+			switch operator {
+			case FilterOperatorILike:
+				sqlOperator = "ILIKE"
+			case FilterOperatorLike:
+				sqlOperator = "LIKE"
+			case FilterOperatorEquals:
+				sqlOperator = "="
+			default:
+				return fmt.Errorf("sqlsee: unsupported filter operator %q", operator)
+			}
+
+			if operator == FilterOperatorEquals && isNull(value) {
+				parts = append(parts, q.column(filter.Field)+" IS NULL")
+				continue
+			}
+
+			parts = append(parts, q.column(filter.Field)+" "+sqlOperator+" "+b.arg(value))
 		}
 
 		op := " AND "
@@ -300,20 +421,20 @@ func (l *Lister[T]) addFilters(b *sqlBuilder, groups []FilterGroup) error {
 	return nil
 }
 
-func (l *Lister[T]) resolveSort(requested []Sort) ([]Sort, error) {
+func (q *Query[T]) resolveSort(requested []Sort) ([]Sort, error) {
 	if len(requested) > 2 {
 		return nil, fmt.Errorf("sqlsee: at most two sort fields are allowed")
 	}
 
 	if len(requested) == 0 {
-		requested = l.defaultSort
+		requested = q.defaultSort
 	}
 
 	seen := make(map[string]struct{}, len(requested)+1)
 	result := make([]Sort, 0, len(requested)+1)
 
 	for _, sort := range requested {
-		if _, ok := l.sortable[sort.Field]; !ok {
+		if _, ok := q.sortable[sort.Field]; !ok {
 			return nil, fmt.Errorf("sqlsee: field %q is not sortable", sort.Field)
 		}
 
@@ -325,14 +446,14 @@ func (l *Lister[T]) resolveSort(requested []Sort) ([]Sort, error) {
 		result = append(result, sort)
 	}
 
-	if _, ok := seen[l.primaryKey]; !ok {
-		result = append(result, Sort{Field: l.primaryKey, Desc: result[len(result)-1].Desc})
+	if _, ok := seen[q.primaryKey]; !ok {
+		result = append(result, Sort{Field: q.primaryKey, Desc: result[len(result)-1].Desc})
 	}
 
 	return result, nil
 }
 
-func (l *Lister[T]) keyset(b *sqlBuilder, sorts []Sort, values []any) string {
+func (q *Query[T]) keyset(b *sqlBuilder, sorts []Sort, values []any) string {
 	args := make([]string, len(values))
 	for i, value := range values {
 		args[i] = b.arg(value)
@@ -343,7 +464,7 @@ func (l *Lister[T]) keyset(b *sqlBuilder, sorts []Sort, values []any) string {
 		terms := make([]string, 0, i+1)
 
 		for j := range i {
-			terms = append(terms, l.column(sorts[j].Field)+" = "+args[j])
+			terms = append(terms, q.column(sorts[j].Field)+" = "+args[j])
 		}
 
 		op := ">"
@@ -352,13 +473,13 @@ func (l *Lister[T]) keyset(b *sqlBuilder, sorts []Sort, values []any) string {
 			op = "<"
 		}
 
-		terms = append(terms, l.column(sort.Field)+" "+op+" "+args[i])
+		terms = append(terms, q.column(sort.Field)+" "+op+" "+args[i])
 		branches[i] = "(" + strings.Join(terms, " AND ") + ")"
 	}
 
 	return "(" + strings.Join(branches, " OR ") + ")"
 }
 
-func (l *Lister[T]) column(name string) string {
-	return quote(l.alias) + "." + quote(name)
+func (q *Query[T]) column(name string) string {
+	return quote(q.alias) + "." + quote(name)
 }

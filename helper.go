@@ -13,13 +13,13 @@ func queryFingerprint(
 	table string,
 	sorts []Sort,
 	filters []FilterGroup,
-	scope string,
+	scope any,
 ) (string, error) {
 	raw, err := json.Marshal(struct {
 		Table   string        `json:"table"`
 		Sorts   []Sort        `json:"sorts"`
 		Filters []FilterGroup `json:"filters"`
-		Scope   string        `json:"scope"`
+		Scope   any           `json:"scope"`
 	}{table, sorts, filters, scope})
 	if err != nil {
 		return "", err
@@ -68,8 +68,8 @@ func isNull(value any) bool {
 }
 
 func allowedSet(
-  fields []string,
-  meta modelMeta,
+	fields []string,
+	meta modelMeta,
 ) (map[string]struct{}, error) {
 	set := make(map[string]struct{}, len(fields))
 	for _, field := range fields {
@@ -87,15 +87,29 @@ func quote(identifier string) string {
 	return `"` + strings.ReplaceAll(identifier, `"`, `""`) + `"`
 }
 
-func quoteQualified(identifier string) (string, error) {
+// QuoteIdentifier safely quotes a single PostgreSQL identifier.
+func QuoteIdentifier(identifier string) (string, error) {
+	if identifier == "" || strings.ContainsRune(identifier, '\x00') {
+		return "", fmt.Errorf("sqlsee: invalid identifier %q", identifier)
+	}
+
+	return quote(identifier), nil
+}
+
+// QuoteQualifiedIdentifier safely quotes a dot-qualified PostgreSQL identifier.
+func QuoteQualifiedIdentifier(identifier string) (string, error) {
 	parts := strings.Split(identifier, ".")
 	for i, part := range parts {
-		if part == "" {
+		quoted, err := QuoteIdentifier(part)
+		if err != nil {
 			return "", fmt.Errorf("sqlsee: invalid identifier %q", identifier)
 		}
-
-		parts[i] = quote(part)
+		parts[i] = quoted
 	}
 
 	return strings.Join(parts, "."), nil
+}
+
+func quoteQualified(identifier string) (string, error) {
+	return QuoteQualifiedIdentifier(identifier)
 }

@@ -16,10 +16,10 @@ type cursorPayload struct {
 
 func encodeCursor(query string, values []any, secret []byte) (string, error) {
 	payload := cursorPayload{
-    Version: 1,
-    Query: query,
-    Keys: make([]json.RawMessage, len(values)),
-  }
+		Version: 1,
+		Query:   query,
+		Keys:    make([]json.RawMessage, len(values)),
+	}
 
 	for i, value := range values {
 		raw, err := json.Marshal(value)
