@@ -16,6 +16,7 @@
           packages = [
             go-task
             go_1_26
+            opencode
           ];
           shellHook = ''
             export PATH="${pkgs.go_1_26}/bin:$PATH"

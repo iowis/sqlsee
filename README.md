@@ -226,10 +226,18 @@ func WithTenant(tenantID uuid.UUID) sqlsee.ListOption {
 
 `PluginBuilder.Join` accepts a complete PostgreSQL join clause.
 `PluginBuilder.Where` accepts a predicate without the `WHERE` keyword; sqlsee
-combines it with other predicates using `AND`. Placeholders are local to each
-clause and start at `$1`. sqlsee validates and renumbers them in the final query,
-so values remain pgx parameters. SQL text must come from trusted plugin code,
+combines it with other predicates using `AND`. `PluginBuilder.Select` adds a
+column to the SELECT list after the model columns; it takes a SQL expression,
+an alias, and optional arguments. Placeholders are local to each clause and
+start at `$1`. sqlsee validates and renumbers them in the final query, so
+values remain pgx parameters. SQL text must come from trusted plugin code,
 never from a client.
+
+Select aliases must be valid PostgreSQL identifiers and must not collide
+with model columns or another plugin's select alias. When a plugin projects
+columns, call `Query.ListWithExtras` instead of `Query.List` to receive the
+per-row projected values alongside the scanned models. `Query.List` ignores
+plugin select columns (they remain in the SQL but are not surfaced).
 
 Every installed plugin runs once per `List` call in installation order. A
 handler receives `PluginInput.Present() == false` when its per-call option was
@@ -240,56 +248,13 @@ Plugin clauses, arguments, and installation order are part of the cursor
 fingerprint. Supply the same plugin options when fetching the next page; a
 cursor cannot be reused with a different plugin scope.
 
-## ReBAC extension
+## Built-in Plugins
 
-The `rebac` subpackage is a bundled plugin for relationship-based authorization.
-It does not require a PostgreSQL permission function: it injects the permission
-lookup directly as a correlated predicate while preserving the normal Query API:
+sqlsee ships with the following built-in plugins:
 
-```go
-groups, err := sqlsee.New[Group](pool, sqlsee.Config{
-	Table: "public.groups",
-	Alias: "g",
-}, rebac.WithReBAC[uuid.UUID](rebac.Config{
-	OwnerField: "owner_id",
-
-	// These names are defaults and can be changed independently.
-	AccessTable:            "group_access",
-	AccessTargetField:      "target_id",
-	AccessUserField:        "user_id",
-	AccessGroupField:       "group_id",
-	AccessPermissionsField: "permissions",
-	AccessActivatedAtField: "activated_at",
-}))
-if err != nil {
-	return err
-}
-
-page, err := groups.List(
-	ctx,
-	sqlsee.Request{Limit: 25},
-	rebac.WithSubject(
-		rebac.Subject[uuid.UUID]{
-			UserID:   userID,
-			GroupIDs: groupIDs,
-		},
-		[]int32{permissionRead, permissionList},
-	),
-)
-```
-
-`TargetField` defaults to the base query's primary key. An access row contributes
-permissions only when its configured activation column is non-null and its user
-or group matches the subject. The combined permissions must contain every
-requested permission. When `OwnerField` is set, ownership grants access without
-requiring an access row.
-
-The access table may be schema-qualified, and every table and column identifier
-is safely quoted. The extension expects UUID subjects and targets plus PostgreSQL
-`int[]` permissions. Nil group slices are sent as empty arrays; an empty
-permission request is rejected. Omitting `rebac.WithSubject` is also rejected,
-so an installed ReBAC plugin fails closed. Subject, groups, and permissions are
-included in the cursor scope automatically.
+- [`rebac`](./rebac/README.md) — relationship-based authorization. Filters list
+  queries by the permissions a subject holds via an access table, and optionally
+  projects the effective permissions per item.
 
 ## Sorting
 

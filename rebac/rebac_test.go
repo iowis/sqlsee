@@ -59,6 +59,18 @@ func newFakeRows(rows [][]any) *fakeRows {
 	}
 }
 
+func newFakeRowsWithPermission(rows [][]any) *fakeRows {
+	return &fakeRows{
+		fields: []pgconn.FieldDescription{
+			{Name: "id"},
+			{Name: "object_id"},
+			{Name: "owner_id"},
+			{Name: "permission"},
+		},
+		rows: rows,
+	}
+}
+
 func (r *fakeRows) Close() { r.closed = true }
 
 func (r *fakeRows) Err() error { return nil }
@@ -132,18 +144,20 @@ func TestListUsesInlinePermissionPredicate(t *testing.T) {
 	require.Empty(t, page.Items)
 	require.Len(t, db.queries, 1)
 	require.Contains(t, db.queries[0].sql,
-		`FROM "public"."resources" AS "r" WHERE ("r"."owner_id" = $1::uuid OR (`)
+		`FROM "public"."resources" AS "r" LEFT JOIN LATERAL (`)
 	require.Contains(t, db.queries[0].sql,
 		`FROM "group_access" AS "sqlsee_rebac_access"`)
 	require.Contains(t, db.queries[0].sql,
-		`CROSS JOIN LATERAL unnest("sqlsee_rebac_access"."permissions") AS "sqlsee_rebac_permission"("value")`)
+		`CROSS JOIN LATERAL unnest("sqlsee_rebac_access"."permissions") AS "sqlsee_rebac_perm"("value")`)
 	require.Contains(t, db.queries[0].sql,
 		`"sqlsee_rebac_access"."target_id" = "r"."id"`)
 	require.Contains(t, db.queries[0].sql,
 		`"sqlsee_rebac_access"."activated_at" IS NOT NULL`)
-	require.Contains(t, db.queries[0].sql, `) @> $3::int[])`)
+	require.Contains(t, db.queries[0].sql,
+		`"r"."owner_id" = $3::uuid OR "sqlsee_rebac_permissions"."permissions" @> $4::int[]`)
 	require.NotContains(t, db.queries[0].sql, "effective_group_permissions")
-	require.Equal(t, []any{userID, []uuid.UUID{groupID}, []int32{1, 3}, 51}, db.queries[0].args)
+	require.NotContains(t, db.queries[0].sql, `"permission"`)
+	require.Equal(t, []any{userID, []uuid.UUID{groupID}, userID, []int32{1, 3}, 51}, db.queries[0].args)
 }
 
 func TestListNormalizesNilGroups(t *testing.T) {
@@ -319,4 +333,120 @@ func TestCursorIsBoundToSubjectAndPermissions(t *testing.T) {
 	)
 	require.EqualError(t, err, "sqlsee: cursor does not belong to this query")
 	require.Len(t, db.queries, 1)
+}
+
+func TestListProjectsPermissionColumn(t *testing.T) {
+	db := &recordingDB{}
+	query := newBase(t, db, WithReBAC[uuid.UUID](Config{}))
+	userID := uuid.New()
+
+	_, err := List[resource, uuid.UUID](
+		t.Context(),
+		query,
+		sqlsee.Request{},
+		Subject[uuid.UUID]{UserID: userID},
+		[]int32{1},
+	)
+
+	require.NoError(t, err)
+	require.Len(t, db.queries, 1)
+	require.Contains(t, db.queries[0].sql, `AS "permission"`)
+	require.Contains(t, db.queries[0].sql,
+		`"sqlsee_rebac_permissions"."permissions" AS "permission"`)
+	require.Equal(t, []any{userID, []uuid.UUID{}, []int32{1}, 51}, db.queries[0].args)
+}
+
+func TestListReturnsEffectivePermissions(t *testing.T) {
+	firstID := uuid.New()
+	secondID := uuid.New()
+	ownerID := uuid.New()
+	db := &recordingDB{rows: []pgx.Rows{
+		newFakeRowsWithPermission([][]any{
+			{firstID, uuid.New(), ownerID, []int32{1, 2, 4}},
+			{secondID, uuid.New(), ownerID, []int32{3}},
+		}),
+	}}
+	query := newBase(t, db, WithReBAC[uuid.UUID](Config{}))
+	userID := uuid.New()
+
+	page, err := List[resource, uuid.UUID](
+		t.Context(),
+		query,
+		sqlsee.Request{},
+		Subject[uuid.UUID]{UserID: userID},
+		[]int32{1},
+	)
+	require.NoError(t, err)
+	require.Len(t, page.Items, 2)
+	require.Equal(t, []int32{1, 2, 4}, page.Items[0].Permission)
+	require.Equal(t, firstID, page.Items[0].Model.ID)
+	require.Equal(t, []int32{3}, page.Items[1].Permission)
+	require.Equal(t, secondID, page.Items[1].Model.ID)
+}
+
+func TestListProjectionCursorBoundToSubjectAndPermissions(t *testing.T) {
+	firstID := uuid.New()
+	ownerID := uuid.New()
+	db := &recordingDB{rows: []pgx.Rows{
+		newFakeRowsWithPermission([][]any{
+			{firstID, uuid.New(), ownerID, []int32{1}},
+			{uuid.New(), uuid.New(), ownerID, []int32{1}},
+		}),
+	}}
+	query := newBase(t, db, WithReBAC[uuid.UUID](Config{}))
+	userID := uuid.New()
+	subject := Subject[uuid.UUID]{UserID: userID, GroupIDs: []uuid.UUID{uuid.New()}}
+
+	page, err := List[resource, uuid.UUID](
+		t.Context(),
+		query,
+		sqlsee.Request{Limit: 1},
+		subject,
+		[]int32{1},
+	)
+	require.NoError(t, err)
+	require.NotEmpty(t, page.NextCursor)
+
+	_, err = List[resource, uuid.UUID](
+		t.Context(),
+		query,
+		sqlsee.Request{Limit: 1, Cursor: page.NextCursor},
+		Subject[uuid.UUID]{UserID: uuid.New(), GroupIDs: subject.GroupIDs},
+		[]int32{1},
+	)
+	require.EqualError(t, err, "sqlsee: cursor does not belong to this query")
+
+	_, err = List[resource, uuid.UUID](
+		t.Context(),
+		query,
+		sqlsee.Request{Limit: 1, Cursor: page.NextCursor},
+		subject,
+		[]int32{2},
+	)
+	require.EqualError(t, err, "sqlsee: cursor does not belong to this query")
+}
+
+func TestListProjectionRejectsAliasCollision(t *testing.T) {
+	type modelWithPermission struct {
+		ID         uuid.UUID `db:"id"`
+		Permission []int32   `db:"permission"`
+	}
+
+	db := &recordingDB{}
+	query, err := sqlsee.New[modelWithPermission](db, sqlsee.Config{
+		Table: "resources",
+	}, WithReBAC[uuid.UUID](Config{}))
+	require.NoError(t, err)
+
+	page, err := List[modelWithPermission, uuid.UUID](
+		t.Context(),
+		query,
+		sqlsee.Request{},
+		Subject[uuid.UUID]{UserID: uuid.New()},
+		[]int32{1},
+	)
+
+	require.Empty(t, page.Items)
+	require.EqualError(t, err,
+		`sqlsee: plugin select alias "permission" collides with model field`)
 }

@@ -13,12 +13,14 @@ type sqlClauseKind uint8
 const (
 	sqlClauseJoin sqlClauseKind = iota + 1
 	sqlClauseWhere
+	sqlClauseSelect
 )
 
 type sqlClause struct {
-	kind sqlClauseKind
-	sql  string
-	args []any
+	kind  sqlClauseKind
+	sql   string
+	alias string
+	args  []any
 }
 
 // Option configures a Query during construction.
@@ -66,23 +68,47 @@ func (c PluginContext) Column(field string) (string, error) {
 // PluginBuilder collects trusted, parameterized SQL contributed by a plugin.
 // Its values are valid only for the current handler invocation.
 type PluginBuilder struct {
-	clauses []sqlClause
+	clauses   []sqlClause
+	selectMap map[string]struct{}
 }
 
 // Join adds a complete JOIN clause after the configured table. Placeholders
 // are local to the clause and start at $1.
 func (b *PluginBuilder) Join(sql string, args ...any) error {
-	return b.add(sqlClauseJoin, sql, args)
+	return b.add(sqlClause{kind: sqlClauseJoin, sql: sql, args: args})
 }
 
 // Where adds a predicate combined with all other predicates using AND. The SQL
 // must not include the WHERE keyword. Placeholders are local to the predicate.
 func (b *PluginBuilder) Where(sql string, args ...any) error {
-	return b.add(sqlClauseWhere, sql, args)
+	return b.add(sqlClause{kind: sqlClauseWhere, sql: sql, args: args})
 }
 
-func (b *PluginBuilder) add(kind sqlClauseKind, sql string, args []any) error {
-	clause := sqlClause{kind: kind, sql: strings.TrimSpace(sql), args: append([]any(nil), args...)}
+// Select adds a column to the SELECT list. The expression is appended after
+// the model columns. Alias must be a non-empty, valid PostgreSQL identifier
+// that does not collide with a model column or another plugin's select alias.
+// Placeholders are local to the expression and start at $1.
+func (b *PluginBuilder) Select(sql, alias string, args ...any) error {
+	return b.add(sqlClause{kind: sqlClauseSelect, sql: sql, alias: alias, args: args})
+}
+
+func (b *PluginBuilder) add(clause sqlClause) error {
+	clause.sql = strings.TrimSpace(clause.sql)
+	if clause.kind == sqlClauseSelect {
+		alias := strings.TrimSpace(clause.alias)
+		quoted, err := QuoteIdentifier(alias)
+		if err != nil {
+			return fmt.Errorf("sqlsee: select alias: %w", err)
+		}
+		if b.selectMap == nil {
+			b.selectMap = make(map[string]struct{})
+		}
+		if _, dup := b.selectMap[quoted]; dup {
+			return fmt.Errorf("sqlsee: duplicate select alias %q", alias)
+		}
+		b.selectMap[quoted] = struct{}{}
+		clause.alias = alias
+	}
 	if _, err := compileSQLClause(clause, 0); err != nil {
 		return err
 	}
@@ -132,9 +158,17 @@ type pluginFingerprint struct {
 }
 
 type pluginClauseFingerprint struct {
-	Kind string `json:"kind"`
-	SQL  string `json:"sql"`
-	Args []any  `json:"args,omitempty"`
+	Kind  string `json:"kind"`
+	SQL   string `json:"sql"`
+	Alias string `json:"alias,omitempty"`
+	Args  []any  `json:"args,omitempty"`
+}
+
+// selectColumn is a compiled, placeholder-renumbered SELECT expression with
+// its alias, ready to append to the query's SELECT list.
+type selectColumn struct {
+	sql   string
+	alias string
 }
 
 func isNilPlugin(plugin Plugin) bool {
@@ -154,15 +188,16 @@ func isNilPlugin(plugin Plugin) bool {
 func applyPluginResults(
 	b *sqlBuilder,
 	results []pluginResult,
-) ([]string, any, error) {
+) ([]string, []selectColumn, any, error) {
 	joins := []string{}
+	selects := []selectColumn{}
 	wheres := []string{}
 	fingerprint := make([]pluginFingerprint, len(results))
 	for i, result := range results {
 		fingerprint[i].Name = result.name
 	}
 
-	for _, kind := range []sqlClauseKind{sqlClauseJoin, sqlClauseWhere} {
+	for _, kind := range []sqlClauseKind{sqlClauseSelect, sqlClauseJoin, sqlClauseWhere} {
 		for i, result := range results {
 			for _, clause := range result.clauses {
 				if clause.kind != kind {
@@ -171,21 +206,26 @@ func applyPluginResults(
 
 				compiled, err := compileSQLClause(clause, len(b.args))
 				if err != nil {
-					return nil, nil, err
+					return nil, nil, nil, err
 				}
 
 				b.args = append(b.args, clause.args...)
 				kindName := "where"
-				if kind == sqlClauseJoin {
+				switch kind {
+				case sqlClauseSelect:
+					kindName = "select"
+					selects = append(selects, selectColumn{sql: compiled, alias: clause.alias})
+				case sqlClauseJoin:
 					kindName = "join"
 					joins = append(joins, compiled)
-				} else {
+				default:
 					wheres = append(wheres, "("+compiled+")")
 				}
 				fingerprint[i].Clauses = append(fingerprint[i].Clauses, pluginClauseFingerprint{
-					Kind: kindName,
-					SQL:  clause.sql,
-					Args: append([]any(nil), clause.args...),
+					Kind:  kindName,
+					SQL:   clause.sql,
+					Alias: clause.alias,
+					Args:  append([]any(nil), clause.args...),
 				})
 			}
 		}
@@ -193,14 +233,14 @@ func applyPluginResults(
 
 	b.where = append(b.where, wheres...)
 	if len(results) == 0 {
-		return joins, "", nil
+		return joins, selects, "", nil
 	}
 
-	return joins, fingerprint, nil
+	return joins, selects, fingerprint, nil
 }
 
 func compileSQLClause(clause sqlClause, offset int) (string, error) {
-	if clause.kind != sqlClauseJoin && clause.kind != sqlClauseWhere {
+	if clause.kind != sqlClauseJoin && clause.kind != sqlClauseWhere && clause.kind != sqlClauseSelect {
 		return "", fmt.Errorf("sqlsee: invalid custom SQL clause")
 	}
 

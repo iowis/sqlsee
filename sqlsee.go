@@ -278,38 +278,79 @@ func (q *Query[T]) List(
 	req Request,
 	options ...ListOption,
 ) (Page[T], error) {
-	return q.list(ctx, req, options)
+	page, err := q.list(ctx, req, options, false)
+	if err != nil {
+		return Page[T]{}, err
+	}
+	return page.Page, nil
+}
+
+// PageWithExtras is the result of ListWithExtras. Each entry in Extras holds
+// the projected columns contributed by plugins for the item at the same index
+// in Items, keyed by the alias the plugin declared.
+type PageWithExtras[T any] struct {
+	Items      []T
+	Extras     []map[string]any
+	NextCursor string
+	HasMore    bool
+}
+
+// ListWithExtras behaves like List but also returns plugin-provided projection
+// columns. Plugins that contributed Select columns populate the per-row
+// Extras map keyed by the declared alias. Plugins that only contribute Join or
+// Where clauses leave Extras empty for that row.
+func (q *Query[T]) ListWithExtras(
+	ctx context.Context,
+	req Request,
+	options ...ListOption,
+) (PageWithExtras[T], error) {
+	page, err := q.list(ctx, req, options, true)
+	if err != nil {
+		return PageWithExtras[T]{}, err
+	}
+	return PageWithExtras[T]{
+		Items:      page.Page.Items,
+		Extras:     page.Extras,
+		NextCursor: page.Page.NextCursor,
+		HasMore:    page.Page.HasMore,
+	}, nil
+}
+
+type fullPage[T any] struct {
+	Page   Page[T]
+	Extras []map[string]any
 }
 
 func (q *Query[T]) list(
 	ctx context.Context,
 	req Request,
 	options []ListOption,
-) (Page[T], error) {
+	collectExtras bool,
+) (fullPage[T], error) {
 	limit := req.Limit
 	if limit == 0 {
 		limit = q.defaultLimit
 	}
 
 	if limit < 1 || limit > q.maxLimit {
-		return Page[T]{}, fmt.Errorf("sqlsee: limit must be between 1 and %d", q.maxLimit)
+		return fullPage[T]{}, fmt.Errorf("sqlsee: limit must be between 1 and %d", q.maxLimit)
 	}
 
 	sorts, err := q.resolveSort(req.Sort)
 	if err != nil {
-		return Page[T]{}, err
+		return fullPage[T]{}, err
 	}
 
 	inputs := make(map[string]PluginInput, len(options))
 	for _, option := range options {
 		if strings.TrimSpace(option.plugin) == "" {
-			return Page[T]{}, fmt.Errorf("sqlsee: plugin option name is required")
+			return fullPage[T]{}, fmt.Errorf("sqlsee: plugin option name is required")
 		}
 		if _, installed := q.pluginNames[option.plugin]; !installed {
-			return Page[T]{}, fmt.Errorf("sqlsee: plugin %q is not installed", option.plugin)
+			return fullPage[T]{}, fmt.Errorf("sqlsee: plugin %q is not installed", option.plugin)
 		}
 		if _, duplicate := inputs[option.plugin]; duplicate {
-			return Page[T]{}, fmt.Errorf("sqlsee: duplicate option for plugin %q", option.plugin)
+			return fullPage[T]{}, fmt.Errorf("sqlsee: duplicate option for plugin %q", option.plugin)
 		}
 		inputs[option.plugin] = PluginInput{present: true, value: option.value}
 	}
@@ -319,7 +360,7 @@ func (q *Query[T]) list(
 		input := inputs[plugin.name]
 		builder := &PluginBuilder{}
 		if err := plugin.handler(ctx, input, builder); err != nil {
-			return Page[T]{}, fmt.Errorf("sqlsee: plugin %q: %w", plugin.name, err)
+			return fullPage[T]{}, fmt.Errorf("sqlsee: plugin %q: %w", plugin.name, err)
 		}
 		results = append(results, pluginResult{
 			name:    plugin.name,
@@ -328,43 +369,57 @@ func (q *Query[T]) list(
 	}
 
 	b := &sqlBuilder{}
-	joins, pluginScope, err := applyPluginResults(b, results)
+	joins, selects, pluginScope, err := applyPluginResults(b, results)
 	if err != nil {
-		return Page[T]{}, err
+		return fullPage[T]{}, err
 	}
 	if err := q.addFilters(b, req.Where); err != nil {
-		return Page[T]{}, err
+		return fullPage[T]{}, err
 	}
 
 	queryKey, err := queryFingerprint(q.table, sorts, req.Where, pluginScope)
 	if err != nil {
-		return Page[T]{}, err
+		return fullPage[T]{}, err
 	}
 
 	if req.Cursor != "" {
 		cursor, err := decodeCursor(req.Cursor, q.cursorSecret)
 		if err != nil {
-			return Page[T]{}, err
+			return fullPage[T]{}, err
 		}
 
 		if cursor.Query != queryKey || len(cursor.Keys) != len(sorts) {
-			return Page[T]{}, fmt.Errorf("sqlsee: cursor does not belong to this query")
+			return fullPage[T]{}, fmt.Errorf("sqlsee: cursor does not belong to this query")
 		}
 
 		values := make([]any, len(sorts))
 		for i, sort := range sorts {
 			values[i], err = decodeValue(cursor.Keys[i], q.meta.fields[sort.Field].typ)
 			if err != nil || isNull(values[i]) {
-				return Page[T]{}, fmt.Errorf("sqlsee: invalid cursor value for %q", sort.Field)
+				return fullPage[T]{}, fmt.Errorf("sqlsee: invalid cursor value for %q", sort.Field)
 			}
 		}
 
 		b.where = append(b.where, q.keyset(b, sorts, values))
 	}
 
+	selectList := strings.Join(q.columns, ", ")
+	if len(selects) > 0 {
+		parts := make([]string, len(selects))
+		for i, sel := range selects {
+			if _, ok := q.meta.fields[sel.alias]; ok {
+				return fullPage[T]{}, fmt.Errorf(
+					"sqlsee: plugin select alias %q collides with model field", sel.alias)
+			}
+			alias, _ := QuoteIdentifier(sel.alias)
+			parts[i] = sel.sql + " AS " + alias
+		}
+		selectList += ", " + strings.Join(parts, ", ")
+	}
+
 	var sql strings.Builder
 	sql.WriteString("SELECT ")
-	sql.WriteString(strings.Join(q.columns, ", "))
+	sql.WriteString(selectList)
 	sql.WriteString(" FROM ")
 	sql.WriteString(q.from)
 	if len(joins) > 0 {
@@ -392,32 +447,38 @@ func (q *Query[T]) list(
 
 	rows, err := q.db.Query(ctx, sql.String(), b.args...)
 	if err != nil {
-		return Page[T]{}, fmt.Errorf("sqlsee: query: %w", err)
+		return fullPage[T]{}, fmt.Errorf("sqlsee: query: %w", err)
 	}
 
-	items, err := pgx.CollectRows(rows, pgx.RowToStructByName[T])
+	items, extras, err := collectRows[T](rows, q.meta, collectExtras)
 	if err != nil {
-		return Page[T]{}, fmt.Errorf("sqlsee: scan: %w", err)
+		return fullPage[T]{}, fmt.Errorf("sqlsee: scan: %w", err)
 	}
 
 	page := Page[T]{Items: items}
+	result := fullPage[T]{Page: page, Extras: extras}
 	if len(items) <= limit {
-		return page, nil
+		return result, nil
 	}
 
 	page.Items, page.HasMore = items[:limit], true
+	result.Page = page
+	if collectExtras {
+		result.Extras = extras[:limit]
+	}
 	keys := make([]any, len(sorts))
 
 	for i, sort := range sorts {
 		keys[i], err = q.meta.value(page.Items[len(page.Items)-1], sort.Field)
 		if err != nil || isNull(keys[i]) {
-			return Page[T]{}, fmt.Errorf("sqlsee: sort field %q must be non-null", sort.Field)
+			return fullPage[T]{}, fmt.Errorf("sqlsee: sort field %q must be non-null", sort.Field)
 		}
 	}
 
 	page.NextCursor, err = encodeCursor(queryKey, keys, q.cursorSecret)
+	result.Page = page
 
-	return page, err
+	return result, err
 }
 
 func (q *Query[T]) addFilters(b *sqlBuilder, groups []FilterGroup) error {

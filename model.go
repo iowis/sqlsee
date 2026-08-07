@@ -7,6 +7,7 @@ import (
 )
 
 type modelMeta struct {
+	typ     reflect.Type
 	columns []string
 	fields  map[string]fieldMeta
 	err     error
@@ -52,8 +53,9 @@ func inspectModel(typ reflect.Type) modelMeta {
 	}
 
 	meta := modelMeta{
+		typ:    typ,
 		columns: make([]string, 0, typ.NumField()),
-		fields:  map[string]fieldMeta{},
+		fields: map[string]fieldMeta{},
 	}
 
 	for i := 0; i < typ.NumField(); i++ {

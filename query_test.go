@@ -606,3 +606,93 @@ func TestQueryRequestValidation(t *testing.T) {
 		})
 	}
 }
+
+func newFakeRowsWithExtra(rows [][]any) *fakeRows {
+	return &fakeRows{
+		fields: []pgconn.FieldDescription{
+			{Name: "id"},
+			{Name: "name"},
+			{Name: "active"},
+			{Name: "extra"},
+		},
+		rows: rows,
+	}
+}
+
+func TestListWithExtrasReturnsProjectedColumns(t *testing.T) {
+	pluginName := "test/projection"
+	projPlugin := testPlugin{
+		name: pluginName,
+		install: func(ctx PluginContext) (PluginHandler, error) {
+			return func(_ context.Context, _ PluginInput, b *PluginBuilder) error {
+				return b.Select(`$1::text`, "extra", "value")
+			}, nil
+		},
+	}
+
+	db := &recordingDB{rows: []pgx.Rows{
+		newFakeRowsWithExtra([][]any{
+			{1, "alice", true, "hello"},
+			{2, "bob", false, "world"},
+		}),
+	}}
+	query := newQueryWithPlugins(t, db, projPlugin)
+
+	page, err := query.ListWithExtras(t.Context(), Request{})
+
+	require.NoError(t, err)
+	require.Len(t, page.Items, 2)
+	require.Equal(t, queryModel{ID: 1, Name: "alice", Active: true}, page.Items[0])
+	require.Equal(t, queryModel{ID: 2, Name: "bob", Active: false}, page.Items[1])
+	require.Len(t, page.Extras, 2)
+	require.Equal(t, "hello", page.Extras[0]["extra"])
+	require.Equal(t, "world", page.Extras[1]["extra"])
+	require.Contains(t, db.queries[0].sql, ` AS "extra"`)
+}
+
+func TestListIgnoresSelectColumnsWhenNotCollectingExtras(t *testing.T) {
+	pluginName := "test/projection-ignored"
+	projPlugin := testPlugin{
+		name: pluginName,
+		install: func(ctx PluginContext) (PluginHandler, error) {
+			return func(_ context.Context, _ PluginInput, b *PluginBuilder) error {
+				return b.Select(`$1::text`, "extra", "value")
+			}, nil
+		},
+	}
+
+	db := &recordingDB{rows: []pgx.Rows{
+		newFakeRows([][]any{
+			{1, "alice", true},
+		}),
+	}}
+	query := newQueryWithPlugins(t, db, projPlugin)
+
+	page, err := query.List(t.Context(), Request{})
+
+	require.NoError(t, err)
+	require.Len(t, page.Items, 1)
+	require.Equal(t, queryModel{ID: 1, Name: "alice", Active: true}, page.Items[0])
+	require.Contains(t, db.queries[0].sql, ` AS "extra"`)
+}
+
+func TestListWithExtrasRejectsAliasCollision(t *testing.T) {
+	pluginName := "test/collision"
+	collisionPlugin := testPlugin{
+		name: pluginName,
+		install: func(ctx PluginContext) (PluginHandler, error) {
+			return func(_ context.Context, _ PluginInput, b *PluginBuilder) error {
+				return b.Select(`$1::int`, "name", 1)
+			}, nil
+		},
+	}
+
+	db := &recordingDB{}
+	query := newQueryWithPlugins(t, db, collisionPlugin)
+
+	page, err := query.ListWithExtras(t.Context(), Request{})
+
+	require.Empty(t, page.Items)
+	require.EqualError(t, err,
+		`sqlsee: plugin select alias "name" collides with model field`)
+}

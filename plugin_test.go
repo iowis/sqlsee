@@ -14,6 +14,10 @@ func testJoin(sql string, args ...any) sqlClause {
 	return sqlClause{kind: sqlClauseJoin, sql: sql, args: args}
 }
 
+func testSelect(sql, alias string, args ...any) sqlClause {
+	return sqlClause{kind: sqlClauseSelect, sql: sql, alias: alias, args: args}
+}
+
 func TestCompileSQLClauseRenumbersPostgreSQLPlaceholders(t *testing.T) {
 	clause := testWhere(
 		`value = $1 OR backup = $1 OR other = $2`,
@@ -148,4 +152,83 @@ func TestJoinAcceptsPostgreSQLJoinForms(t *testing.T) {
 		_, err := compileSQLClause(join, 0)
 		require.NoError(t, err)
 	}
+}
+
+func TestCompileSQLClauseRenumbersSelectPlaceholders(t *testing.T) {
+	clause := testSelect(
+		`COALESCE(array_agg($1), '{}'::int[])`,
+		"permission",
+		[]int32{1, 2},
+	)
+
+	compiled, err := compileSQLClause(clause, 5)
+
+	require.NoError(t, err)
+	require.Equal(t, `COALESCE(array_agg($6), '{}'::int[])`, compiled)
+}
+
+func TestPluginBuilderSelectValidation(t *testing.T) {
+	t.Run("renumbers placeholders", func(t *testing.T) {
+		var b PluginBuilder
+		require.NoError(t, b.Select(`$1::int[]`, "permission", []int32{1}))
+		require.Len(t, b.clauses, 1)
+	})
+
+	t.Run("rejects empty alias", func(t *testing.T) {
+		var b PluginBuilder
+		err := b.Select(`1`, "", 1)
+		require.EqualError(t, err, `sqlsee: select alias: sqlsee: invalid identifier ""`)
+	})
+
+	t.Run("rejects invalid alias", func(t *testing.T) {
+		var b PluginBuilder
+		err := b.Select(`1`, "bad\x00alias", 1)
+		require.ErrorContains(t, err, "sqlsee: select alias")
+	})
+
+	t.Run("rejects empty sql", func(t *testing.T) {
+		var b PluginBuilder
+		err := b.Select(``, "permission", 1)
+		require.EqualError(t, err, "sqlsee: custom SQL clause must not be empty")
+	})
+
+	t.Run("rejects duplicate alias", func(t *testing.T) {
+		var b PluginBuilder
+		require.NoError(t, b.Select(`$1::int`, "permission", 1))
+		err := b.Select(`$1::int`, "permission", 2)
+		require.EqualError(t, err, `sqlsee: duplicate select alias "permission"`)
+	})
+
+	t.Run("rejects semicolons", func(t *testing.T) {
+		var b PluginBuilder
+		err := b.Select(`$1; DROP TABLE`, "permission", 1)
+		require.EqualError(t, err, "sqlsee: custom SQL clauses must not contain semicolons")
+	})
+
+	t.Run("rejects unused arguments", func(t *testing.T) {
+		var b PluginBuilder
+		err := b.Select(`$1`, "permission", 1, 2)
+		require.EqualError(t, err, "sqlsee: custom SQL argument 2 has no placeholder")
+	})
+}
+
+func TestApplyPluginResultsCollectsSelectColumns(t *testing.T) {
+	results := []pluginResult{
+		{
+			name: "test",
+			clauses: []sqlClause{
+				testSelect(`$1::int[]`, "permission", []int32{1}),
+				testWhere(`"perm" @> $1`, []int32{1}),
+			},
+		},
+	}
+
+	b := &sqlBuilder{}
+	joins, selects, _, err := applyPluginResults(b, results)
+	require.NoError(t, err)
+	require.Empty(t, joins)
+	require.Len(t, selects, 1)
+	require.Equal(t, "permission", selects[0].alias)
+	require.Equal(t, `$1::int[]`, selects[0].sql)
+	require.Equal(t, []any{[]int32{1}, []int32{1}}, b.args)
 }
