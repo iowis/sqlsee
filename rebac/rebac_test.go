@@ -386,8 +386,8 @@ func TestListReturnsEffectivePermissions(t *testing.T) {
 	ownerID := uuid.New()
 	db := &recordingDB{rows: []pgx.Rows{
 		newFakeRowsWithPermissions([][]any{
-			{firstID, uuid.New(), ownerID, []int32{1, 2, 4}},
-			{secondID, uuid.New(), ownerID, []int32{3}},
+			{firstID, uuid.New(), ownerID, []any{int32(1), int32(2), int32(4)}},
+			{secondID, uuid.New(), ownerID, []any{int32(3)}},
 		}),
 	}}
 	query := newBase(t, db, WithReBAC[uuid.UUID](Config{}))
@@ -414,8 +414,8 @@ func TestListWithNilPermissionsProjectsAllPermissions(t *testing.T) {
 	ownerID := uuid.New()
 	db := &recordingDB{rows: []pgx.Rows{
 		newFakeRowsWithPermissions([][]any{
-			{firstID, uuid.New(), ownerID, []int32{1, 2, 4}},
-			{secondID, uuid.New(), ownerID, []int32{3}},
+			{firstID, uuid.New(), ownerID, []any{int32(1), int32(2), int32(4)}},
+			{secondID, uuid.New(), ownerID, []any{int32(3)}},
 		}),
 	}}
 	query := newBase(t, db, WithReBAC[uuid.UUID](Config{}))
@@ -437,6 +437,26 @@ func TestListWithNilPermissionsProjectsAllPermissions(t *testing.T) {
 	require.Contains(t, db.queries[0].sql, `<> '{}'::int[]`)
 	require.NotContains(t, db.queries[0].sql, "@>")
 	require.Equal(t, []any{userID, []uuid.UUID{}, 51}, db.queries[0].args)
+}
+
+func TestListConvertsAnySlicePermissions(t *testing.T) {
+	db := &recordingDB{rows: []pgx.Rows{
+		newFakeRowsWithPermissions([][]any{
+			{uuid.New(), uuid.New(), uuid.New(), []any{int32(100), int32(101)}},
+		}),
+	}}
+	query := newBase(t, db, WithReBAC[uuid.UUID](Config{}))
+
+	page, err := List[resource, uuid.UUID](
+		t.Context(),
+		query,
+		sqlsee.Request{},
+		Subject[uuid.UUID]{UserID: uuid.New()},
+		nil,
+	)
+	require.NoError(t, err)
+	require.Len(t, page.Items, 1)
+	require.Equal(t, []int32{100, 101}, page.Items[0].Permissions)
 }
 
 func TestListProjectionCursorBoundToSubjectAndPermissions(t *testing.T) {

@@ -111,8 +111,16 @@ func List[T any, ID any](
 	items := make([]Item[T], len(page.Items))
 	for i, model := range page.Items {
 		var perms []int32
-		if v, ok := page.Extras[i]["permissions"].([]int32); ok {
+		switch v := page.Extras[i]["permissions"].(type) {
+		case []int32:
 			perms = v
+		case []any:
+			perms = make([]int32, 0, len(v))
+			for _, e := range v {
+				if n, ok := e.(int32); ok {
+					perms = append(perms, n)
+				}
+			}
 		}
 		items[i] = Item[T]{Model: model, Permissions: perms}
 	}
