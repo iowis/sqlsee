@@ -226,6 +226,7 @@ func (q *Query[T]) Clone() *Query[T] {
 		maxLimit:     q.maxLimit,
 		cursorSecret: bytes.Clone(q.cursorSecret),
 		pluginNames:  maps.Clone(q.pluginNames),
+    plugins:      q.plugins,
 	}
 }
 

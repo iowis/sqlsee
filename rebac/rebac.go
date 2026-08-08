@@ -51,10 +51,12 @@ type listInput[ID any] struct {
 
 // Item wraps a listed model with the effective permissions the subject holds
 // on it. The model is carried in the Model field and the permissions in
-// Permission.
+// Permissions. Permissions is always the full set of distinct permissions the
+// subject has on the item, regardless of whether the optional permissions
+// filter was supplied.
 type Item[T any] struct {
-	Model      T       `json:"model"`
-	Permission []int32 `json:"permission"`
+	Model       T       `json:"model"`
+	Permissions []int32 `json:"permissions"`
 }
 
 // WithReBAC installs relationship-based access control on a sqlsee.Query.
@@ -62,10 +64,13 @@ func WithReBAC[ID any](cfg Config) sqlsee.Option {
 	return sqlsee.WithPlugin(plugin[ID]{cfg: cfg})
 }
 
-// WithSubject supplies the subject and required permissions for one List
-// call. Every permission must be granted for a row to be returned. The
-// returned option filters rows without projecting permissions; use
-// [List] to also surface the effective permissions per item.
+// WithSubject supplies the subject and optional permission filter for one List
+// call. When permissions is non-empty, only rows whose effective permissions
+// contain every value are returned. When permissions is nil, every row the
+// subject can access (i.e. with at least one granted permission, or via
+// ownership when configured) is returned. The returned option filters rows
+// without projecting permissions; use [List] to also surface the effective
+// permissions per item.
 func WithSubject[ID any](subject Subject[ID], permissions []int32) sqlsee.ListOption {
 	subject.GroupIDs = append([]ID(nil), subject.GroupIDs...)
 	return sqlsee.NewPluginOption(pluginName, listInput[ID]{
@@ -76,9 +81,14 @@ func WithSubject[ID any](subject Subject[ID], permissions []int32) sqlsee.ListOp
 }
 
 // List returns a page whose items carry the effective permissions the subject
-// has on each row, in addition to filtering by the required permissions. It is
-// the opt-in entrypoint for the per-item permission projection; plain
+// has on each row, in addition to filtering by the optional permissions filter.
+// It is the opt-in entrypoint for the per-item permission projection; plain
 // [sqlsee.Query.List] with [WithSubject] filters without projecting.
+//
+// When permissions is non-empty, only rows whose effective permissions contain
+// every value are returned. When permissions is nil, every row the subject can
+// access is returned. In both cases Item.Permissions contains the full set of
+// permissions the subject has on the item.
 func List[T any, ID any](
 	ctx context.Context,
 	q *sqlsee.Query[T],
@@ -101,10 +111,10 @@ func List[T any, ID any](
 	items := make([]Item[T], len(page.Items))
 	for i, model := range page.Items {
 		var perms []int32
-		if v, ok := page.Extras[i]["permission"].([]int32); ok {
+		if v, ok := page.Extras[i]["permissions"].([]int32); ok {
 			perms = v
 		}
-		items[i] = Item[T]{Model: model, Permission: perms}
+		items[i] = Item[T]{Model: model, Permissions: perms}
 	}
 
 	return sqlsee.Page[Item[T]]{
@@ -137,7 +147,6 @@ func (p plugin[ID]) Install(ctx sqlsee.PluginContext) (sqlsee.PluginHandler, err
 	if err != nil {
 		return nil, err
 	}
-	whereSQL := buildWhere(owner)
 	selectExpr := resultAlias + "." + resultColumn
 
 	return func(_ context.Context, input sqlsee.PluginInput, builder *sqlsee.PluginBuilder) error {
@@ -149,9 +158,6 @@ func (p plugin[ID]) Install(ctx sqlsee.PluginContext) (sqlsee.PluginHandler, err
 		if !ok {
 			return fmt.Errorf("invalid rebac.WithSubject value")
 		}
-		if len(value.permissions) == 0 {
-			return fmt.Errorf("permissions cannot be empty")
-		}
 
 		groups := value.subject.GroupIDs
 		if groups == nil {
@@ -162,14 +168,17 @@ func (p plugin[ID]) Install(ctx sqlsee.PluginContext) (sqlsee.PluginHandler, err
 			return err
 		}
 
+		whereSQL := buildWhere(owner, value.permissions)
+		whereArgs := make([]any, 0, 2)
 		if owner != "" {
-			if err := builder.Where(whereSQL, value.subject.UserID, value.permissions); err != nil {
-				return err
-			}
-		} else {
-			if err := builder.Where(whereSQL, value.permissions); err != nil {
-				return err
-			}
+			whereArgs = append(whereArgs, value.subject.UserID)
+		}
+		if len(value.permissions) > 0 {
+			whereArgs = append(whereArgs, value.permissions)
+		}
+
+		if err := builder.Where(whereSQL, whereArgs...); err != nil {
+			return err
 		}
 
 		if value.project {
@@ -188,7 +197,7 @@ const (
 	unnestColumn    = `"value"`
 	resultAlias     = `"sqlsee_rebac_permissions"`
 	resultColumn    = `"permissions"`
-	projectionAlias = "permission"
+	projectionAlias = "permissions"
 )
 
 // buildPermissionJoin returns a LEFT JOIN LATERAL that computes, for each base
@@ -257,12 +266,25 @@ func buildPermissionJoin(target string, cfg Config) (string, error) {
 }
 
 // buildWhere returns the filter predicate referencing the lateral join's
-// computed permissions. When owner is non-empty, ownership grants access
-// without requiring an access row. Placeholders are local: without owner $1 is
-// the required permissions; with owner $1 is the user id and $2 is the required
+// computed permissions. When permissions is non-empty, rows must contain every
+// requested permission (PostgreSQL @> operator, GIN-indexed). When permissions
+// is nil/empty, any row with at least one granted permission qualifies (the
+// effective permissions array is non-empty). When owner is non-empty,
+// ownership grants access without requiring an access row.
+//
+// Placeholders are local to the clause: with an owner, $1 is the user id and
+// $2 (only when permissions is non-empty) is the required permissions; without
+// an owner, $1 (only when permissions is non-empty) is the required
 // permissions.
-func buildWhere(owner string) string {
+func buildWhere(owner string, permissions []int32) string {
 	permRef := resultAlias + "." + resultColumn
+	hasAccess := permRef + " <> '{}'::int[]"
+	if len(permissions) == 0 {
+		if owner == "" {
+			return hasAccess
+		}
+		return owner + " = $1::uuid OR " + hasAccess
+	}
 	if owner == "" {
 		return permRef + " @> $1::int[]"
 	}
