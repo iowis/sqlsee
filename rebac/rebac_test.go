@@ -525,3 +525,128 @@ func TestListProjectionRejectsAliasCollision(t *testing.T) {
 	require.EqualError(t, err,
 		`sqlsee: plugin select alias "permissions" collides with model field`)
 }
+
+func TestListAllDoesNotFilter(t *testing.T) {
+	db := &recordingDB{}
+	query := newBase(t, db, WithReBAC[uuid.UUID](Config{}))
+	userID := uuid.New()
+	groupID := uuid.New()
+
+	_, err := ListAll[resource, uuid.UUID](
+		t.Context(),
+		query,
+		sqlsee.Request{},
+		Subject[uuid.UUID]{UserID: userID, GroupIDs: []uuid.UUID{groupID}},
+	)
+
+	require.NoError(t, err)
+	require.Len(t, db.queries, 1)
+	// The LATERAL join attaches permissions without dropping rows.
+	require.Contains(t, db.queries[0].sql,
+		`FROM "public"."resources" AS "r" LEFT JOIN LATERAL (`)
+	require.Contains(t, db.queries[0].sql,
+		`FROM "group_access" AS "sqlsee_rebac_access"`)
+	// The permissions column is projected (project: true).
+	require.Contains(t, db.queries[0].sql,
+		`"sqlsee_rebac_permissions"."permissions" AS "permissions"`)
+	// No access predicate is emitted: neither the "has any permission" check,
+	// the "@>" containment filter, nor the ownership grant.
+	require.NotContains(t, db.queries[0].sql, `<> '{}'::int[]`)
+	require.NotContains(t, db.queries[0].sql, "@>")
+	require.NotContains(t, db.queries[0].sql, `owner_id" = $`)
+	// Only the join arguments (user id, group ids) and the limit are bound;
+	// no owner/permissions where-args are appended.
+	require.Equal(t, []any{userID, []uuid.UUID{groupID}, 51}, db.queries[0].args)
+}
+
+func TestListAllReturnsAllRowsWithPermissions(t *testing.T) {
+	firstID := uuid.New()
+	secondID := uuid.New()
+	thirdID := uuid.New()
+	ownerID := uuid.New()
+	db := &recordingDB{rows: []pgx.Rows{
+		newFakeRowsWithPermissions([][]any{
+			{firstID, uuid.New(), ownerID, []any{int32(100), int32(101)}},
+			{secondID, uuid.New(), ownerID, []any{}},
+			{thirdID, uuid.New(), ownerID, []any{int32(103)}},
+		}),
+	}}
+	query := newBase(t, db, WithReBAC[uuid.UUID](Config{}))
+	userID := uuid.New()
+
+	page, err := ListAll[resource, uuid.UUID](
+		t.Context(),
+		query,
+		sqlsee.Request{},
+		Subject[uuid.UUID]{UserID: userID},
+	)
+
+	require.NoError(t, err)
+	require.Len(t, page.Items, 3)
+	require.Equal(t, []int32{100, 101}, page.Items[0].Permissions)
+	require.Equal(t, firstID, page.Items[0].Model.ID)
+	require.Empty(t, page.Items[1].Permissions)
+	require.Equal(t, secondID, page.Items[1].Model.ID)
+	require.Equal(t, []int32{103}, page.Items[2].Permissions)
+	require.Equal(t, thirdID, page.Items[2].Model.ID)
+}
+
+func TestListAllCursorNotBindableToList(t *testing.T) {
+	firstID := uuid.New()
+	secondID := uuid.New()
+	ownerID := uuid.New()
+	db := &recordingDB{rows: []pgx.Rows{
+		newFakeRowsWithPermissions([][]any{
+			{firstID, uuid.New(), ownerID, []int32{1}},
+			{secondID, uuid.New(), ownerID, []int32{1}},
+		}),
+	}}
+	query := newBase(t, db, WithReBAC[uuid.UUID](Config{}))
+	userID := uuid.New()
+	subject := Subject[uuid.UUID]{UserID: userID, GroupIDs: []uuid.UUID{uuid.New()}}
+
+	page, err := ListAll[resource, uuid.UUID](
+		t.Context(),
+		query,
+		sqlsee.Request{Limit: 1},
+		subject,
+	)
+	require.NoError(t, err)
+	require.NotEmpty(t, page.NextCursor)
+
+	// A cursor from ListAll must not be accepted by List: the absent WHERE
+	// clause changes the query fingerprint, so the cursor is rejected.
+	_, err = List[resource, uuid.UUID](
+		t.Context(),
+		query,
+		sqlsee.Request{Limit: 1, Cursor: page.NextCursor},
+		subject,
+		[]int32{1},
+	)
+	require.EqualError(t, err, "sqlsee: cursor does not belong to this query")
+}
+
+func TestListAllWithOwnerConfigDoesNotEmitOwnerPredicate(t *testing.T) {
+	db := &recordingDB{}
+	query := newBase(t, db, WithReBAC[uuid.UUID](Config{OwnerField: "owner_id"}))
+	userID := uuid.New()
+
+	_, err := ListAll[resource, uuid.UUID](
+		t.Context(),
+		query,
+		sqlsee.Request{},
+		Subject[uuid.UUID]{UserID: userID},
+	)
+
+	require.NoError(t, err)
+	require.Len(t, db.queries, 1)
+	// The LATERAL join still runs (perms attached where available) but the
+	// ownership predicate is not emitted because ListAll does not filter.
+	require.Contains(t, db.queries[0].sql,
+		`FROM "group_access" AS "sqlsee_rebac_access"`)
+	require.NotContains(t, db.queries[0].sql, `owner_id" = $`)
+	require.NotContains(t, db.queries[0].sql, `<> '{}'::int[]`)
+	require.NotContains(t, db.queries[0].sql, "@>")
+	// Only the join args and limit are bound; no owner where-arg.
+	require.Equal(t, []any{userID, []uuid.UUID{}, 51}, db.queries[0].args)
+}

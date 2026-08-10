@@ -47,6 +47,7 @@ type listInput[ID any] struct {
 	subject     Subject[ID]
 	permissions []int32
 	project     bool
+	filter      bool
 }
 
 // Item wraps a listed model with the effective permissions the subject holds
@@ -77,6 +78,7 @@ func WithSubject[ID any](subject Subject[ID], permissions []int32) sqlsee.ListOp
 		subject:     subject,
 		permissions: append([]int32(nil), permissions...),
 		project:     false,
+		filter:      true,
 	})
 }
 
@@ -101,6 +103,7 @@ func List[T any, ID any](
 		subject:     subject,
 		permissions: append([]int32(nil), permissions...),
 		project:     true,
+		filter:      true,
 	})
 
 	page, err := q.ListWithExtras(ctx, req, opt)
@@ -108,6 +111,43 @@ func List[T any, ID any](
 		return sqlsee.Page[Item[T]]{}, err
 	}
 
+	return projectPage[T](page), nil
+}
+
+// ListAll returns a page of every base row with the subject's effective
+// permissions attached, without filtering by access. Rows the subject has no
+// access to are returned with an empty Permissions slice. It is the
+// project-only counterpart to [List]: useful when the caller has already
+// authorized the listing (e.g. via an RBAC "read all" role) and only needs the
+// per-item permission projection. Item.Permissions always contains the full
+// set of permissions the subject has on the item (possibly empty).
+func ListAll[T any, ID any](
+	ctx context.Context,
+	q *sqlsee.Query[T],
+	req sqlsee.Request,
+	subject Subject[ID],
+) (sqlsee.Page[Item[T]], error) {
+	subject.GroupIDs = append([]ID(nil), subject.GroupIDs...)
+	opt := sqlsee.NewPluginOption(pluginName, listInput[ID]{
+		subject: subject,
+		project: true,
+		filter:  false,
+	})
+
+	page, err := q.ListWithExtras(ctx, req, opt)
+	if err != nil {
+		return sqlsee.Page[Item[T]]{}, err
+	}
+
+	return projectPage[T](page), nil
+}
+
+// projectPage converts a sqlsee page with plugin extras into a page of Items,
+// extracting the per-row permissions projected by the rebac plugin. The
+// permissions column is produced by the LEFT JOIN LATERAL installed by
+// [WithReBAC] and is always present when project is true; it may be nil, an
+// []int32, or an []any depending on the driver/scan path.
+func projectPage[T any](page sqlsee.PageWithExtras[T]) sqlsee.Page[Item[T]] {
 	items := make([]Item[T], len(page.Items))
 	for i, model := range page.Items {
 		var perms []int32
@@ -129,7 +169,7 @@ func List[T any, ID any](
 		Items:      items,
 		NextCursor: page.NextCursor,
 		HasMore:    page.HasMore,
-	}, nil
+	}
 }
 
 func (plugin[ID]) Name() string { return pluginName }
@@ -176,17 +216,19 @@ func (p plugin[ID]) Install(ctx sqlsee.PluginContext) (sqlsee.PluginHandler, err
 			return err
 		}
 
-		whereSQL := buildWhere(owner, value.permissions)
-		whereArgs := make([]any, 0, 2)
-		if owner != "" {
-			whereArgs = append(whereArgs, value.subject.UserID)
-		}
-		if len(value.permissions) > 0 {
-			whereArgs = append(whereArgs, value.permissions)
-		}
+		if value.filter {
+			whereSQL := buildWhere(owner, value.permissions)
+			whereArgs := make([]any, 0, 2)
+			if owner != "" {
+				whereArgs = append(whereArgs, value.subject.UserID)
+			}
+			if len(value.permissions) > 0 {
+				whereArgs = append(whereArgs, value.permissions)
+			}
 
-		if err := builder.Where(whereSQL, whereArgs...); err != nil {
-			return err
+			if err := builder.Where(whereSQL, whereArgs...); err != nil {
+				return err
+			}
 		}
 
 		if value.project {
