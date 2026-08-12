@@ -64,7 +64,7 @@ func TestThirdPartyPluginUsesOnlyPublicAPI(t *testing.T) {
 
 	require.ErrorIs(t, err, errQueryStopped)
 	require.Equal(t,
-		`SELECT "t"."id" AS "id" FROM "resources" AS "t" WHERE ("t"."id" = $1) ORDER BY "t"."id" ASC LIMIT $2`,
+		`SELECT "t"."id" AS "id" FROM "resources" AS "t" WHERE ("t"."id" = $1) ORDER BY "t"."id" ASC NULLS LAST LIMIT $2`,
 		db.sql,
 	)
 	require.Equal(t, []any{42, 51}, db.args)

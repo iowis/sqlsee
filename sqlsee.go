@@ -201,11 +201,11 @@ func New[T any](db DBTX, cfg Config, options ...Option) (*Query[T], error) {
 		pluginNames:  make(map[string]struct{}, len(options)),
 	}
 
-  if len(options) > 0 {
-    if err := query.AddOptions(options...); err != nil {
-      return nil, err
-    }
-  }
+	if len(options) > 0 {
+		if err := query.AddOptions(options...); err != nil {
+			return nil, err
+		}
+	}
 
 	return query, nil
 }
@@ -226,7 +226,7 @@ func (q *Query[T]) Clone() *Query[T] {
 		maxLimit:     q.maxLimit,
 		cursorSecret: bytes.Clone(q.cursorSecret),
 		pluginNames:  maps.Clone(q.pluginNames),
-    plugins:      q.plugins,
+		plugins:      q.plugins,
 	}
 }
 
@@ -250,10 +250,10 @@ func (q *Query[T]) AddOptions(options ...Option) error {
 
 		name := plugin.Name()
 		if strings.TrimSpace(name) == "" {
-			return  fmt.Errorf("sqlsee: plugin name is required")
+			return fmt.Errorf("sqlsee: plugin name is required")
 		}
 		if _, duplicate := q.pluginNames[name]; duplicate {
-			return  fmt.Errorf("sqlsee: duplicate plugin %q", name)
+			return fmt.Errorf("sqlsee: duplicate plugin %q", name)
 		}
 
 		handler, err := plugin.Install(pluginContext)
@@ -396,7 +396,7 @@ func (q *Query[T]) list(
 		values := make([]any, len(sorts))
 		for i, sort := range sorts {
 			values[i], err = decodeValue(cursor.Keys[i], q.meta.fields[sort.Field].typ)
-			if err != nil || isNull(values[i]) {
+			if err != nil {
 				return fullPage[T]{}, fmt.Errorf("sqlsee: invalid cursor value for %q", sort.Field)
 			}
 		}
@@ -438,9 +438,9 @@ func (q *Query[T]) list(
 		}
 		sql.WriteString(q.column(sort.Field))
 		if sort.Desc {
-			sql.WriteString(" DESC")
+			sql.WriteString(" DESC NULLS LAST")
 		} else {
-			sql.WriteString(" ASC")
+			sql.WriteString(" ASC NULLS LAST")
 		}
 	}
 	sql.WriteString(" LIMIT ")
@@ -471,8 +471,8 @@ func (q *Query[T]) list(
 
 	for i, sort := range sorts {
 		keys[i], err = q.meta.value(page.Items[len(page.Items)-1], sort.Field)
-		if err != nil || isNull(keys[i]) {
-			return fullPage[T]{}, fmt.Errorf("sqlsee: sort field %q must be non-null", sort.Field)
+		if err != nil {
+			return fullPage[T]{}, fmt.Errorf("sqlsee: read sort field %q: %w", sort.Field, err)
 		}
 	}
 
@@ -570,27 +570,49 @@ func (q *Query[T]) resolveSort(requested []Sort) ([]Sort, error) {
 }
 
 func (q *Query[T]) keyset(b *sqlBuilder, sorts []Sort, values []any) string {
-	args := make([]string, len(values))
-	for i, value := range values {
-		args[i] = b.arg(value)
-	}
+	// ORDER BY uses NULLS LAST for every field. Keyset pagination therefore
+	// needs to treat NULL as a real ordering state rather than comparing it
+	// with =, <, or > (all of which evaluate to NULL in SQL).
+	//
+	// For a non-null cursor value, NULL belongs after that value, so the
+	// continuation branch also includes `column IS NULL`. For a null cursor
+	// value there is nothing later for that field itself; later sort fields
+	// (ultimately the primary key) advance within the NULL group.
+	branches := make([]string, 0, len(sorts))
 
-	branches := make([]string, len(sorts))
 	for i, sort := range sorts {
 		terms := make([]string, 0, i+1)
 
 		for j := range i {
-			terms = append(terms, q.column(sorts[j].Field)+" = "+args[j])
+			column := q.column(sorts[j].Field)
+			if isNull(values[j]) {
+				terms = append(terms, column+" IS NULL")
+			} else {
+				terms = append(terms, column+" = "+b.arg(values[j]))
+			}
+		}
+
+		// With NULLS LAST, a NULL cursor value has no rows after it at this
+		// sort level. The following branches handle ties using later keys.
+		if isNull(values[i]) {
+			continue
 		}
 
 		op := ">"
-
 		if sort.Desc {
 			op = "<"
 		}
 
-		terms = append(terms, q.column(sort.Field)+" "+op+" "+args[i])
-		branches[i] = "(" + strings.Join(terms, " AND ") + ")"
+		column := q.column(sort.Field)
+		arg := b.arg(values[i])
+		terms = append(terms, "("+column+" "+op+" "+arg+" OR "+column+" IS NULL)")
+		branches = append(branches, "("+strings.Join(terms, " AND ")+")")
+	}
+
+	if len(branches) == 0 {
+		// This can only happen if every sort key is NULL. A real PostgreSQL
+		// primary key is non-null, so this is defensive rather than expected.
+		return "FALSE"
 	}
 
 	return "(" + strings.Join(branches, " OR ") + ")"

@@ -203,7 +203,7 @@ func TestQueryListBuildsFilterOperators(t *testing.T) {
 	require.Equal(t, []queryModel{{ID: 1, Name: "Gopher", Active: true}}, page.Items)
 	require.False(t, page.HasMore)
 	require.Equal(t,
-		`SELECT "u"."id" AS "id", "u"."name" AS "name", "u"."active" AS "active" FROM "public"."users" AS "u" WHERE ("u"."name" ILIKE $1 AND "u"."name" LIKE $2 AND "u"."active" = $3) ORDER BY "u"."name" ASC, "u"."id" ASC LIMIT $4`,
+		`SELECT "u"."id" AS "id", "u"."name" AS "name", "u"."active" AS "active" FROM "public"."users" AS "u" WHERE ("u"."name" ILIKE $1 AND "u"."name" LIKE $2 AND "u"."active" = $3) ORDER BY "u"."name" ASC NULLS LAST, "u"."id" ASC NULLS LAST LIMIT $4`,
 		db.queries[0].sql,
 	)
 	require.Equal(t, []any{"%go%", "Go%", true, 11}, db.queries[0].args)
@@ -286,7 +286,7 @@ func TestQueryListAppliesPluginSQL(t *testing.T) {
 
 	require.NoError(t, err)
 	require.Equal(t,
-		`SELECT "u"."id" AS "id", "u"."name" AS "name", "u"."active" AS "active" FROM "public"."users" AS "u" LEFT JOIN memberships AS m ON m.user_id = "u"."id" AND m.tenant_id = $1 JOIN roles AS r ON r.user_id = "u"."id" AND r.name = $2 WHERE (m.deleted_at IS NULL) AND (r.active = $3) AND ("u"."active" = $4) ORDER BY "u"."name" ASC, "u"."id" ASC LIMIT $5`,
+		`SELECT "u"."id" AS "id", "u"."name" AS "name", "u"."active" AS "active" FROM "public"."users" AS "u" LEFT JOIN memberships AS m ON m.user_id = "u"."id" AND m.tenant_id = $1 JOIN roles AS r ON r.user_id = "u"."id" AND r.name = $2 WHERE (m.deleted_at IS NULL) AND (r.active = $3) AND ("u"."active" = $4) ORDER BY "u"."name" ASC NULLS LAST, "u"."id" ASC NULLS LAST LIMIT $5`,
 		db.queries[0].sql,
 	)
 	require.Equal(t, []any{42, "admin", true, true, 6}, db.queries[0].args)
@@ -329,9 +329,9 @@ func TestQueryListPaginatesWithCursor(t *testing.T) {
 	require.Equal(t, []queryModel{{ID: 2, Name: "Beta", Active: false}}, second.Items)
 	require.False(t, second.HasMore)
 	require.Contains(t, db.queries[1].sql,
-		`WHERE ("u"."active" = $1) AND (("u"."name" > $2) OR ("u"."name" = $2 AND "u"."id" > $3))`,
+		`WHERE ("u"."active" = $1) AND ((("u"."name" > $2 OR "u"."name" IS NULL)) OR ("u"."name" = $3 AND ("u"."id" > $4 OR "u"."id" IS NULL)))`,
 	)
-	require.Equal(t, []any{true, "Alpha", 1, 2}, db.queries[1].args)
+	require.Equal(t, []any{true, "Alpha", "Alpha", 1, 2}, db.queries[1].args)
 }
 
 func TestQueryCursorIsBoundToPluginArguments(t *testing.T) {
@@ -360,9 +360,9 @@ func TestQueryCursorIsBoundToPluginArguments(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []queryModel{{ID: 2, Name: "Beta", Active: true}}, next.Items)
 	require.Contains(t, firstDB.queries[1].sql,
-		`WHERE ("u"."id" <> $1) AND (("u"."name" > $2) OR ("u"."name" = $2 AND "u"."id" > $3))`,
+		`WHERE ("u"."id" <> $1) AND ((("u"."name" > $2 OR "u"."name" IS NULL)) OR ("u"."name" = $3 AND ("u"."id" > $4 OR "u"."id" IS NULL)))`,
 	)
-	require.Equal(t, []any{1, "Alpha", 1, 2}, firstDB.queries[1].args)
+	require.Equal(t, []any{1, "Alpha", "Alpha", 1, 2}, firstDB.queries[1].args)
 
 	_, err = query.List(
 		t.Context(),
